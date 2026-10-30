@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 自动重 roll 插件版
  * 安装位置：SillyTavern/public/scripts/extensions/third-party/nana-auto-reroll/index.js
  * 同目录需要 manifest.json
@@ -19,6 +19,8 @@
     lastErrorLines: [],
     successCount: 0,
     baselineMessageId: -1,
+    /** 最近一次点发送时的楼层数，用来判断这次发送有没有产出正文 */
+    pendingSince: 0,
     status: 'idle',
   };
 
@@ -207,6 +209,7 @@
     '#nana-auto-reroll-root .nar-dot.busy{display:block;background:#d8a74a}',
     '#nana-auto-reroll-root .nar-dot.bad{display:block;background:#c25050}',
     '#nana-auto-reroll-root .nar-panel{position:absolute;bottom:56px;right:0;width:240px;padding:14px;border-radius:12px;background:rgba(28,28,31,.97);border:1px solid rgba(255,255,255,.10);box-shadow:0 8px 28px rgba(0,0,0,.5)}',
+    '@media (max-width:640px){#nana-auto-reroll-root .nar-panel{width:min(240px,calc(100vw - 24px));bottom:54px}}',
     '#nana-auto-reroll-root .nar-panel[hidden]{display:none}',
     '#nana-auto-reroll-root .nar-switch{position:relative;display:inline-flex;align-items:center;padding:2px;border-radius:7px;background:rgba(0,0,0,.34);border:1px solid rgba(255,255,255,.10);cursor:pointer;font-family:inherit;font-size:12px}',
     '#nana-auto-reroll-root .nar-knob{position:absolute;top:2px;left:2px;width:calc(50% - 2px);height:calc(100% - 4px);border-radius:5px;background:rgba(255,255,255,.10);transition:transform .18s,background .18s}',
@@ -423,10 +426,23 @@
         state.lastErrorCode = '';
         state.lastErrorText = '';
         state.baselineMessageId = lastId();
+        state.pendingSince = 0;
+        // 每次开启都重置本轮结果标记，否则上一轮的成功会挡住这一轮
+        settled = false;
+        pendingSuccess = false;
+        if (successTimer !== null) {
+          clearTimeout(successTimer);
+          successTimer = null;
+        }
         // 开启后立即开始连续触发，不等任何失败事件
         scheduleReroll();
       } else {
         clearTimer();
+        if (successTimer !== null) {
+          clearTimeout(successTimer);
+          successTimer = null;
+        }
+        pendingSuccess = false;
         state.status = 'idle';
       }
       render();
@@ -520,14 +536,36 @@
   function applyPos() {
     if (!dom) return;
     if (pos) {
-      dom.root.style.left = pos.x + 'px';
-      dom.root.style.top = pos.y + 'px';
+      var maxX = window.innerWidth - 48;
+      var maxY = window.innerHeight - 48;
+      // 手机等窄屏下，电脑上记下的坐标可能完全落在屏幕外，这里强制收回可见区域
+      var x = Math.min(Math.max(0, pos.x), Math.max(0, maxX));
+      var y = Math.min(Math.max(0, pos.y), Math.max(0, maxY));
+      if (x !== pos.x || y !== pos.y) {
+        pos = { x: x, y: y };
+        savePos();
+      }
+      dom.root.style.left = x + 'px';
+      dom.root.style.top = y + 'px';
       dom.root.style.right = 'auto';
       dom.root.style.bottom = 'auto';
+    } else if (isNarrowScreen()) {
+      // 窄屏默认贴近右下，避开底部输入栏
+      dom.root.style.left = 'auto';
+      dom.root.style.top = 'auto';
+      dom.root.style.right = '12px';
+      dom.root.style.bottom = '140px';
     } else {
+      dom.root.style.left = 'auto';
+      dom.root.style.top = 'auto';
       dom.root.style.right = '20px';
       dom.root.style.bottom = '110px';
     }
+  }
+
+  /** 判断是否窄屏（手机/竖屏平板） */
+  function isNarrowScreen() {
+    return window.innerWidth <= 640;
   }
 
   function render() {
@@ -589,9 +627,21 @@
 
   function tryReroll() {
     if (!settings.enabled) return;
+    // 本轮已成功，任何残留的定时器都不再触发
+    if (settled) return;
 
-    // 只保留这一条保护：正在生成时不点，避免打断当前回复。
-    // 其余"是否失败""是否成功"的判断全部去掉，开关开启即按间隔连续触发。
+    // 点击前先确认：如果上一次发送后已经产出了新的正文，就直接收手，
+    // 不能再发一次。这一步必须放在 fireAttempt 之前，否则会先发再判。
+    if (state.pendingSince > 0 && lastId() > state.pendingSince && lastText().trim().length > 0) {
+      settled = true;
+      state.baselineMessageId = lastId();
+      state.pendingSince = 0;
+      logSuccess();
+      stop('success');
+      return;
+    }
+
+    // 正在生成时不点，避免打断当前回复
     if (isGenerating()) {
       state.status = 'waiting';
       render();
@@ -607,6 +657,7 @@
     fireAttempt();
 
     state.attempts += 1;
+    state.pendingSince = lastId();
     state.status = 'retrying';
     render();
 
@@ -795,16 +846,22 @@
    */
   var pendingSuccess = false;
   var successTimer = null;
+  /** 本轮是否已有结果。为真时 tryReroll 立即放弃后续触发 */
+  var settled = false;
 
   function markPendingSuccess() {
+    if (settled) return;
     pendingSuccess = true;
     if (successTimer !== null) clearTimeout(successTimer);
     var baselineId = state.baselineMessageId;
     successTimer = setTimeout(function () {
+      successTimer = null;
+      if (settled) return;
       if (!pendingSuccess) return;
       if (!settings.enabled) return;
       // 楼层出现了新的正文，且没有报错，视为成功
       if (lastId() > baselineId && lastText().trim().length > 0) {
+        settled = true;
         state.baselineMessageId = lastId();
         logSuccess();
         stop('success');
