@@ -21,10 +21,16 @@
     baselineMessageId: -1,
     /** 最近一次点发送时的楼层数，用来判断这次发送有没有产出正文 */
     pendingSince: 0,
+    /** 下次触发的截止时间戳，0 表示当前没有在等待 */
+    waitUntil: 0,
+    /** 本次等待的总时长 */
+    waitTotal: 0,
     status: 'idle',
   };
 
   var timer = null;
+  /** 倒计时刷新定时器 */
+  var cooldownTimer = null;
   var dom = null;
   var listeners = [];
   var pos = loadPos();
@@ -44,13 +50,32 @@
           intervalSec: typeof p.intervalSec === 'number' ? p.intervalSec : 2,
           intervalMinSec: typeof p.intervalMinSec === 'number' ? p.intervalMinSec : 2,
           intervalMaxSec: typeof p.intervalMaxSec === 'number' ? p.intervalMaxSec : 5,
+          intervalMode: p.intervalMode === 'backoff' ? 'backoff' : 'random',
+          backoffBaseSec: typeof p.backoffBaseSec === 'number' ? p.backoffBaseSec : 1,
+          backoffFactor: typeof p.backoffFactor === 'number' ? p.backoffFactor : 2,
+          backoffType: p.backoffType === 'linear' ? 'linear' : 'multiply',
+          backoffStepSec: typeof p.backoffStepSec === 'number' ? p.backoffStepSec : 2,
+          backoffMaxSec: typeof p.backoffMaxSec === 'number' ? p.backoffMaxSec : 300,
           mode: p.mode === 'regen' ? 'regen' : 'send',
         };
       }
     } catch (e) {
       console.warn('[自动重roll] 读取设置失败', e);
     }
-    return { enabled: false, maxAttempts: 5, intervalSec: 2, intervalMinSec: 2, intervalMaxSec: 5, mode: 'send' };
+    return {
+      enabled: false,
+      maxAttempts: 5,
+      intervalSec: 2,
+      intervalMinSec: 2,
+      intervalMaxSec: 5,
+      intervalMode: 'random',
+      backoffBaseSec: 1,
+      backoffFactor: 2,
+      backoffType: 'multiply',
+      backoffStepSec: 2,
+      backoffMaxSec: 300,
+      mode: 'send',
+    };
   }
 
   function saveSettings() {
@@ -87,6 +112,9 @@
 
   /** 在 [min, max] 之间取一个随机毫秒数，用于防封 */
   function intervalMs() {
+    if (settings.intervalMode === 'backoff') {
+      return backoffMs();
+    }
     var lo = Math.max(0, settings.intervalMinSec);
     var hi = Math.max(0, settings.intervalMaxSec);
     if (hi < lo) {
@@ -95,6 +123,36 @@
       hi = t;
     }
     var sec = lo + Math.random() * (hi - lo);
+    return Math.round(sec * 1000);
+  }
+
+  /**
+   * 递增方式两种：
+   * - 乘法（factor）：等待时间 = 基础值 × 倍率^重试序号，例如 1s、2s、4s、8s…
+   * - 加法（linear）：等待时间 = 基础值 + 增量 × 重试序号，例如 1s、3s、5s、7s…
+   *
+   * 上限由 backoffMaxSec 控制，避免等得无限长。
+   */
+  function backoffMs() {
+    var base = Math.max(0.1, settings.backoffBaseSec);
+    var cap = Math.max(base, settings.backoffMaxSec);
+    var step = Math.max(0, state.attempts);
+    var sec;
+
+    if (settings.backoffType === 'linear') {
+      // 加法：每次在基础值上加固定秒数，增长更平缓
+      var inc = Math.max(0, settings.backoffStepSec);
+      sec = base + inc * step;
+    } else {
+      // 乘法：倍数必须大于 1，否则退避没有意义
+      var factor = Math.max(1.05, settings.backoffFactor);
+      sec = base * Math.pow(factor, step);
+    }
+
+    if (sec > cap) sec = cap;
+
+    // 加一点抖动，避免多次重试在同一秒撞点
+    sec = sec * (0.9 + Math.random() * 0.2);
     return Math.round(sec * 1000);
   }
 
@@ -211,6 +269,7 @@
     '#nana-auto-reroll-root .nar-panel{position:absolute;bottom:56px;right:0;width:240px;padding:14px;border-radius:12px;background:rgba(28,28,31,.97);border:1px solid rgba(255,255,255,.10);box-shadow:0 8px 28px rgba(0,0,0,.5)}',
     '@media (max-width:640px){#nana-auto-reroll-root .nar-panel{width:min(240px,calc(100vw - 24px));bottom:54px}}',
     '#nana-auto-reroll-root .nar-panel[hidden]{display:none}',
+    '#nana-auto-reroll-root .nar-hide{display:none!important}',
     '#nana-auto-reroll-root .nar-switch{position:relative;display:inline-flex;align-items:center;padding:2px;border-radius:7px;background:rgba(0,0,0,.34);border:1px solid rgba(255,255,255,.10);cursor:pointer;font-family:inherit;font-size:12px}',
     '#nana-auto-reroll-root .nar-knob{position:absolute;top:2px;left:2px;width:calc(50% - 2px);height:calc(100% - 4px);border-radius:5px;background:rgba(255,255,255,.10);transition:transform .18s,background .18s}',
     '#nana-auto-reroll-root .nar-switch.on .nar-knob{transform:translateX(100%);background:rgba(111,191,139,.20);box-shadow:inset 0 0 0 1px rgba(111,191,139,.55)}',
@@ -222,10 +281,18 @@
     '#nana-auto-reroll-root input{width:64px;background:rgba(0,0,0,.32);border:1px solid rgba(255,255,255,.10);color:inherit;border-radius:6px;padding:3px 7px;font-size:12px;font-family:inherit;text-align:right}',
     '#nana-auto-reroll-root input:focus{outline:none;border-color:rgba(111,191,139,.45)}',
     '#nana-auto-reroll-root .nar-counters{display:flex;gap:16px;font-size:12px;opacity:.72;margin-bottom:10px}',
+    '#nana-auto-reroll-root .nar-countdown-row{display:flex;align-items:center;justify-content:space-between;font-size:12px;margin-bottom:10px}',
+    '#nana-auto-reroll-root .nar-countdown{font-variant-numeric:tabular-nums;color:#d8a74a;font-weight:600}',
+    '#nana-auto-reroll-root .nar-countdown-row.nar-gen .nar-countdown{color:rgba(220,220,226,.55);font-weight:400}',
     '#nana-auto-reroll-root .nar-mode{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}',
     '#nana-auto-reroll-root .nar-seg{display:inline-flex;padding:2px;border-radius:7px;background:rgba(0,0,0,.34);border:1px solid rgba(255,255,255,.10)}',
     '#nana-auto-reroll-root .nar-mode-btn{background:none;border:none;color:rgba(220,220,226,.5);font-family:inherit;font-size:12px;padding:2px 8px;border-radius:5px;cursor:pointer;transition:color .16s,background .16s}',
     '#nana-auto-reroll-root .nar-mode-btn.on{color:#6fbf8b;background:rgba(111,191,139,.18);box-shadow:inset 0 0 0 1px rgba(111,191,139,.5)}',
+    '#nana-auto-reroll-root .nar-int-mode .nar-intmode-btn{background:none;border:none;color:rgba(220,220,226,.5);font-family:inherit;font-size:12px;padding:2px 8px;border-radius:5px;cursor:pointer;transition:color .16s,background .16s}',
+    '#nana-auto-reroll-root .nar-int-mode .nar-intmode-btn.on{color:#6fbf8b;background:rgba(111,191,139,.18);box-shadow:inset 0 0 0 1px rgba(111,191,139,.5)}',
+    '#nana-auto-reroll-root .nar-step-mode .nar-stepmode-btn{background:none;border:none;color:rgba(220,220,226,.5);font-family:inherit;font-size:12px;padding:2px 10px;border-radius:5px;cursor:pointer;transition:color .16s,background .16s}',
+    '#nana-auto-reroll-root .nar-step-mode .nar-stepmode-btn.on{color:#6fbf8b;background:rgba(111,191,139,.18);box-shadow:inset 0 0 0 1px rgba(111,191,139,.5)}',
+    '#nana-auto-reroll-root .nar-backoff-hint{font-size:11px;opacity:.5;margin:-4px 0 9px;line-height:1.5;word-break:break-all}',
     '#nana-auto-reroll-root .nar-dhead{display:flex;align-items:center;justify-content:space-between;font-size:12px;opacity:.62;margin-bottom:5px}',
     '#nana-auto-reroll-root .nar-tools{display:flex;align-items:center;gap:8px}',
     '#nana-auto-reroll-root .nar-ibtn{background:none;border:none;padding:0;color:inherit;cursor:pointer;display:flex;align-items:center;font-family:inherit;font-size:12px;opacity:.8}',
@@ -274,12 +341,33 @@
     '</div>' +
     '<div class="nar-row"><span class="nar-label">重试次数</span>' +
     '<input class="nar-attempts" type="number" min="-1" step="1"></div>' +
-    '<div class="nar-row"><span class="nar-label">间隔（秒）</span>' +
+    '<div class="nar-mode">' +
+    '<span class="nar-label">间隔方式</span>' +
+    '<span class="nar-seg nar-int-mode" role="radiogroup">' +
+    '<button class="nar-intmode-btn" type="button" data-imode="random">随机</button>' +
+    '<button class="nar-intmode-btn" type="button" data-imode="backoff">指数退避</button>' +
+    '</span>' +
+    '</div>' +
+    '<div class="nar-row nar-int-random"><span class="nar-label">间隔（秒）</span>' +
     '<span class="nar-range">' +
     '<input class="nar-int-min" type="number" min="0" step="0.5">' +
     '<span class="nar-range-sep">~</span>' +
     '<input class="nar-int-max" type="number" min="0" step="0.5">' +
     '</span></div>' +
+    '<div class="nar-row nar-int-backoff nar-hide"><span class="nar-label">起始（秒）</span>' +
+    '<input class="nar-backoff-base" type="number" min="0.1" step="0.5"></div>' +
+    '<div class="nar-row nar-int-backoff nar-hide"><span class="nar-label">递增方式</span>' +
+    '<span class="nar-seg nar-step-mode" role="radiogroup">' +
+    '<button class="nar-stepmode-btn" type="button" data-stype="multiply">乘</button>' +
+    '<button class="nar-stepmode-btn" type="button" data-stype="linear">加</button>' +
+    '</span></div>' +
+    '<div class="nar-row nar-int-backoff nar-mul-row nar-hide"><span class="nar-label">每次乘</span>' +
+    '<input class="nar-backoff-factor" type="number" min="1.05" step="0.1"></div>' +
+    '<div class="nar-row nar-int-backoff nar-add-row nar-hide"><span class="nar-label">每次加（秒）</span>' +
+    '<input class="nar-backoff-step" type="number" min="0" step="0.5"></div>' +
+    '<div class="nar-row nar-int-backoff nar-hide"><span class="nar-label">上限（秒）</span>' +
+    '<input class="nar-backoff-max" type="number" min="1" step="5"></div>' +
+    '<div class="nar-backoff-hint nar-hide"></div>' +
     '<div class="nar-mode">' +
     '<span class="nar-label">失败后</span>' +
     '<span class="nar-seg" role="radiogroup">' +
@@ -291,7 +379,10 @@
     '<span>已重试 <span class="nar-ac">0</span></span>' +
     '<span>失败 <span class="nar-fc">0</span></span>' +
     '</div>' +
-    '<div class="nar-dhead"><span>失败详情</span><span class="nar-tools">' +
+    '<div class="nar-countdown-row">' +
+    '<span class="nar-label">下次重 roll</span>' +
+    '<span class="nar-countdown nar-countdown-val">—</span>' +
+    '</div>' +    '<div class="nar-dhead"><span>失败详情</span><span class="nar-tools">' +
 '<button class="nar-ibtn nar-copy" type="button" title="复制记录">复制</button>' +
     '<button class="nar-ibtn nar-clear" type="button" title="清空">清空</button>' +
     '<button class="nar-ibtn nar-expand" type="button" title="展开">' + ICON_CHEVRON + '</button>' +
@@ -328,6 +419,15 @@
     var inputAttempts = q('.nar-attempts');
     var inputIntMin = q('.nar-int-min');
     var inputIntMax = q('.nar-int-max');
+    var inputBackoffBase = q('.nar-backoff-base');
+    var inputBackoffFactor = q('.nar-backoff-factor');
+    var inputBackoffStep = q('.nar-backoff-step');
+    var stepModeBtns = root.querySelectorAll('.nar-stepmode-btn');
+    var mulRow = q('.nar-mul-row');
+    var addRow = q('.nar-add-row');
+    var inputBackoffMax = q('.nar-backoff-max');
+    var backoffHint = q('.nar-backoff-hint');
+    var intModeBtns = root.querySelectorAll('.nar-intmode-btn');
     var detail = q('.nar-detail');
     var btnExpand = q('.nar-expand');
     var btnClear = q('.nar-clear');
@@ -347,6 +447,10 @@
     inputAttempts.value = String(settings.maxAttempts);
     inputIntMin.value = String(settings.intervalMinSec);
     inputIntMax.value = String(settings.intervalMaxSec);
+    inputBackoffBase.value = String(settings.backoffBaseSec);
+    inputBackoffFactor.value = String(settings.backoffFactor);
+    inputBackoffStep.value = String(settings.backoffStepSec);
+    inputBackoffMax.value = String(settings.backoffMaxSec);
 
     dom = {
       root: root,
@@ -360,6 +464,15 @@
       et: q('.nar-et'),
       el: q('.nar-et'),
       detailEl: detail,
+      countdownEl: q('.nar-countdown-val'),
+      countdownRow: q('.nar-countdown-row'),
+      intModeBtns: intModeBtns,
+      randomEls: root.querySelectorAll('.nar-int-random'),
+      backoffEls: root.querySelectorAll('.nar-int-backoff'),
+      stepModeBtns: stepModeBtns,
+      mulRow: mulRow,
+      addRow: addRow,
+      backoffHint: backoffHint,
       dot: q('.nar-dot'),
     };
 
@@ -471,6 +584,57 @@
       saveSettings();
     });
 
+    // ---- 指数退避参数 ----
+    inputBackoffBase.addEventListener('change', function () {
+      var v = Number(inputBackoffBase.value);
+      settings.backoffBaseSec = isFinite(v) && v >= 0.1 ? v : 1;
+      inputBackoffBase.value = String(settings.backoffBaseSec);
+      saveSettings();
+      render();
+    });
+
+    inputBackoffFactor.addEventListener('change', function () {
+      var v = Number(inputBackoffFactor.value);
+      settings.backoffFactor = isFinite(v) && v >= 1.05 ? v : 2;
+      inputBackoffFactor.value = String(settings.backoffFactor);
+      saveSettings();
+      render();
+    });
+
+    inputBackoffStep.addEventListener('change', function () {
+      var v = Number(inputBackoffStep.value);
+      settings.backoffStepSec = isFinite(v) && v >= 0 ? v : 2;
+      inputBackoffStep.value = String(settings.backoffStepSec);
+      saveSettings();
+      render();
+    });
+
+    // ---- 递增方式切换：乘 / 加 ----
+    Array.prototype.forEach.call(stepModeBtns, function (btn) {
+      btn.addEventListener('click', function () {
+        settings.backoffType = btn.getAttribute('data-stype') === 'linear' ? 'linear' : 'multiply';
+        saveSettings();
+        render();
+      });
+    });
+
+    inputBackoffMax.addEventListener('change', function () {
+      var v = Number(inputBackoffMax.value);
+      settings.backoffMaxSec = isFinite(v) && v >= 1 ? v : 300;
+      inputBackoffMax.value = String(settings.backoffMaxSec);
+      saveSettings();
+      render();
+    });
+
+    // ---- 间隔方式切换：随机 / 指数退避 ----
+    Array.prototype.forEach.call(intModeBtns, function (btn) {
+      btn.addEventListener('click', function () {
+        settings.intervalMode = btn.getAttribute('data-imode') === 'backoff' ? 'backoff' : 'random';
+        saveSettings();
+        render();
+      });
+    });
+
     // ---- 模式切换：重新发送 / 重新生成 ----
     Array.prototype.forEach.call(dom.modeBtns, function (btn) {
       btn.addEventListener('click', function () {
@@ -568,6 +732,33 @@
     return window.innerWidth <= 640;
   }
 
+  /** 生成退避序列预览，让用户直观看到每一档等待多久 */
+  function buildBackoffPreview() {
+    var base = Math.max(0.1, settings.backoffBaseSec);
+    var cap = Math.max(base, settings.backoffMaxSec);
+    var parts = [];
+    for (var i = 0; i < 6; i++) {
+      var sec;
+      if (settings.backoffType === 'linear') {
+        sec = base + Math.max(0, settings.backoffStepSec) * i;
+      } else {
+        sec = base * Math.pow(Math.max(1.05, settings.backoffFactor), i);
+      }
+      if (sec > cap) sec = cap;
+      parts.push(formatSec(sec));
+      if (sec >= cap) break;
+    }
+    return parts.join(' / ');
+  }
+
+  function formatSec(sec) {
+    if (sec >= 60) {
+      var m = sec / 60;
+      return (Math.round(m * 10) / 10) + '分';
+    }
+    return (Math.round(sec * 10) / 10) + '秒';
+  }
+
   function render() {
     if (!dom) return;
 
@@ -600,6 +791,32 @@
       btn.classList.toggle('on', btn.getAttribute('data-mode') === settings.mode);
     });
 
+    // 间隔方式：随机显示两个输入框，指数退避显示三个参数与预览
+    var isBackoff = settings.intervalMode === 'backoff';
+    Array.prototype.forEach.call(dom.intModeBtns, function (btn) {
+      btn.classList.toggle('on', btn.getAttribute('data-imode') === (isBackoff ? 'backoff' : 'random'));
+    });
+    Array.prototype.forEach.call(dom.randomEls, function (el) {
+      el.classList.toggle('nar-hide', isBackoff);
+    });
+    Array.prototype.forEach.call(dom.backoffEls, function (el) {
+      // 乘/加两行由下面的递增方式单独控制，这里跳过，否则会被重复覆盖
+      if (el.classList.contains('nar-mul-row') || el.classList.contains('nar-add-row')) return;
+      el.classList.toggle('nar-hide', !isBackoff);
+    });
+
+    // 递增方式：乘 显示"每次乘"，加 显示"每次加"
+    var isLinear = settings.backoffType === 'linear';
+    Array.prototype.forEach.call(dom.stepModeBtns, function (btn) {
+      btn.classList.toggle('on', btn.getAttribute('data-stype') === (isLinear ? 'linear' : 'multiply'));
+    });
+    if (dom.mulRow) dom.mulRow.classList.toggle('nar-hide', !isBackoff || isLinear);
+    if (dom.addRow) dom.addRow.classList.toggle('nar-hide', !isBackoff || !isLinear);
+
+    if (isBackoff && dom.backoffHint) {
+      dom.backoffHint.textContent = '实际序列：' + buildBackoffPreview();
+    }
+
     dom.fab.classList.toggle('on', settings.enabled);
 
     var dot = '';
@@ -619,6 +836,7 @@
 
   function stop(status) {
     clearTimer();
+    clearCooldown();
     settings.enabled = false;
     saveSettings();
     state.status = status;
@@ -641,11 +859,30 @@
       return;
     }
 
-    // 正在生成时不点，避免打断当前回复
+    // 正在生成时不点，也不倒数。倒计时的意义是"还有多久发下一次"，
+    // 生成期间根本不该有下一次，显示剩余秒数会误导。
     if (isGenerating()) {
       state.status = 'waiting';
+      clearCooldownDisplay();
       render();
-      timer = setTimeout(tryReroll, Math.max(200, intervalMs()));
+      timer = setTimeout(tryReroll, 300);
+      return;
+    }
+
+    // 生成已结束。如果这一轮产出了正文，就是成功；否则视为失败，开始倒数
+    if (state.pendingSince > 0) {
+      var gotContent = lastId() > state.pendingSince && lastText().trim().length > 0;
+      if (gotContent) {
+        settled = true;
+        state.baselineMessageId = lastId();
+        state.pendingSince = 0;
+        logSuccess();
+        stop('success');
+        return;
+      }
+      // 确认失败：才开始为下一轮倒数
+      state.pendingSince = 0;
+      startNextCountdown();
       return;
     }
 
@@ -659,10 +896,81 @@
     state.attempts += 1;
     state.pendingSince = lastId();
     state.status = 'retrying';
+    clearCooldownDisplay();
     render();
 
-    timer = setTimeout(tryReroll, intervalMs());
+    timer = setTimeout(tryReroll, 300);
     markPendingSuccess();
+  }
+
+  /** 确认失败后，为下一轮触发倒数；数完就点下一次 */
+  function startNextCountdown() {
+    var wait = intervalMs();
+    state.status = 'cooldown';
+    startCooldown(wait);
+    render();
+    timer = setTimeout(function () {
+      if (!settings.enabled || settled) return;
+      tryReroll();
+    }, wait);
+  }
+
+  /**
+   * 进入等待：记录这一轮要等的毫秒数与截止时间，
+   * 由每 200ms 一次的定时器把剩余秒数画到面板上。
+   */
+  function startCooldown(ms) {
+    state.waitUntil = Date.now() + ms;
+    state.waitTotal = ms;
+    updateCountdown();
+    if (cooldownTimer !== null) return;
+    cooldownTimer = setInterval(updateCountdown, 200);
+  }
+
+  /** 把倒计时清空，但保留刷新定时器（用于切换到"生成中"等状态） */
+  function clearCooldownDisplay() {
+    state.waitUntil = 0;
+    state.waitTotal = 0;
+    updateCountdown();
+  }
+
+  function clearCooldown() {
+    clearCooldownDisplay();
+    if (cooldownTimer !== null) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+    }
+  }
+
+  /**
+   * 显示规则：
+   * - 生成中：显示"生成中"，不显示秒数
+   * - 正在为下一轮倒数：显示剩余秒数
+   * - 其他：显示"—"
+   */
+  function updateCountdown() {
+    if (!dom || !dom.countdownEl) return;
+
+    if (dom.countdownRow) {
+      dom.countdownRow.classList.toggle('nar-gen', state.status === 'waiting');
+    }
+
+    if (state.status === 'waiting') {
+      dom.countdownEl.textContent = '生成中';
+      return;
+    }
+
+    if (!state.waitUntil) {
+      dom.countdownEl.textContent = '—';
+      return;
+    }
+
+    var left = state.waitUntil - Date.now();
+    if (left <= 0) {
+      dom.countdownEl.textContent = '0.0 秒';
+      return;
+    }
+    dom.countdownEl.textContent = (Math.round(left / 100) / 10).toFixed(1) + ' 秒';
   }
 
   /** 记录一次失败，编号按失败次数递增，便于对账 */
@@ -724,7 +1032,9 @@
     if (!settings.enabled) return;
     state.status = 'waiting';
     render();
-    timer = setTimeout(tryReroll, intervalMs());
+    var wait = intervalMs();
+    startCooldown(wait);
+    timer = setTimeout(tryReroll, wait);
   }
 
   // ------------------------------------------------------------ 事件绑定
@@ -939,6 +1249,7 @@
 
   function destroy() {
     clearTimer();
+    clearCooldown();
     stopErrorWatch();
     unbind();
     if (dom && dom.root) dom.root.remove();
