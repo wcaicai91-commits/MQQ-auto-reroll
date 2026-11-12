@@ -722,12 +722,12 @@
       dom.root.style.right = 'auto';
       dom.root.style.bottom = 'auto';
     } else if (isNarrowScreen()) {
-      // 窄屏（手机）：默认放在屏幕右中偏下、明显可见的位置，
-      // 避免贴到底部被输入栏盖住。上下留出余量，左右也往里收一点。
+      // 窄屏（手机）：固定在右侧偏下，避免被输入栏和菜单遮挡
       dom.root.style.left = 'auto';
       dom.root.style.top = 'auto';
-      dom.root.style.right = '16px';
-      dom.root.style.bottom = '52%';
+      dom.root.style.right = '10px';   // 稍微贴近右边缘
+      dom.root.style.bottom = '80px';  // 改为固定像素，避免百分比缩放时飘走
+      dom.root.style.zIndex = '999999'; // 强行拉高层级
     } else {
       dom.root.style.left = 'auto';
       dom.root.style.top = 'auto';
