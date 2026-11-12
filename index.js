@@ -21,10 +21,14 @@
     baselineMessageId: -1,
     /** 最近一次点发送时的楼层数，用来判断这次发送有没有产出正文 */
     pendingSince: 0,
+    /** 发起请求前最后一条的内容，供重新生成模式比对 */
+    pendingTextBefore: null,
     /** 下次触发的截止时间戳，0 表示当前没有在等待 */
     waitUntil: 0,
     /** 本次等待的总时长 */
     waitTotal: 0,
+    /** 本轮生成开始的时间戳，0 表示当前没在生成 */
+    genStartedAt: 0,
     status: 'idle',
   };
 
@@ -550,13 +554,17 @@
         // 开启后立即开始连续触发，不等任何失败事件
         scheduleReroll();
       } else {
+        // 关了就是关了：清掉主定时器、成功判定、倒计时的刷新定时器，全部停干净
         clearTimer();
         if (successTimer !== null) {
           clearTimeout(successTimer);
           successTimer = null;
         }
         pendingSuccess = false;
+        settled = false;
+        clearCooldown();
         state.status = 'idle';
+        state.pendingSince = 0;
       }
       render();
     });
@@ -714,11 +722,12 @@
       dom.root.style.right = 'auto';
       dom.root.style.bottom = 'auto';
     } else if (isNarrowScreen()) {
-      // 窄屏默认贴近右下，避开底部输入栏
+      // 窄屏（手机）：默认放在屏幕右中偏下、明显可见的位置，
+      // 避免贴到底部被输入栏盖住。上下留出余量，左右也往里收一点。
       dom.root.style.left = 'auto';
       dom.root.style.top = 'auto';
-      dom.root.style.right = '12px';
-      dom.root.style.bottom = '140px';
+      dom.root.style.right = '16px';
+      dom.root.style.bottom = '52%';
     } else {
       dom.root.style.left = 'auto';
       dom.root.style.top = 'auto';
@@ -843,14 +852,32 @@
     render();
   }
 
+  /**
+   * 判断本轮请求是否产出了正文。
+   *
+   * - 重新发送：楼层数增加，且新楼层有内容。
+   * - 重新生成：楼层数不变，但最后一条的内容相对发起前发生了变化。
+   */
+  function hasProduced() {
+    var text = lastText();
+    if (text.trim().length === 0) return false;
+
+    if (settings.mode === 'regen') {
+      // 重新生成不增加楼层，比内容是否变化
+      return text !== state.pendingTextBefore;
+    }
+
+    return lastId() > state.pendingSince;
+  }
+
   function tryReroll() {
     if (!settings.enabled) return;
     // 本轮已成功，任何残留的定时器都不再触发
     if (settled) return;
 
-    // 点击前先确认：如果上一次发送后已经产出了新的正文，就直接收手，
+    // 点击前先确认：如果上一次请求后已经产出了正文，就直接收手，
     // 不能再发一次。这一步必须放在 fireAttempt 之前，否则会先发再判。
-    if (state.pendingSince > 0 && lastId() > state.pendingSince && lastText().trim().length > 0) {
+    if (state.pendingSince > 0 && hasProduced()) {
       settled = true;
       state.baselineMessageId = lastId();
       state.pendingSince = 0;
@@ -871,8 +898,7 @@
 
     // 生成已结束。如果这一轮产出了正文，就是成功；否则视为失败，开始倒数
     if (state.pendingSince > 0) {
-      var gotContent = lastId() > state.pendingSince && lastText().trim().length > 0;
-      if (gotContent) {
+      if (hasProduced()) {
         settled = true;
         state.baselineMessageId = lastId();
         state.pendingSince = 0;
@@ -895,6 +921,8 @@
 
     state.attempts += 1;
     state.pendingSince = lastId();
+    // 记下发起前的最后一条内容，供"重新生成"模式判断是否真的产出了新内容
+    state.pendingTextBefore = lastText();
     state.status = 'retrying';
     clearCooldownDisplay();
     render();
@@ -956,7 +984,12 @@
     }
 
     if (state.status === 'waiting') {
-      dom.countdownEl.textContent = '生成中';
+      if (state.genStartedAt > 0) {
+        var genSec = (Date.now() - state.genStartedAt) / 1000;
+        dom.countdownEl.textContent = '生成中 ' + (Math.round(genSec * 10) / 10).toFixed(1) + ' 秒';
+      } else {
+        dom.countdownEl.textContent = '生成中';
+      }
       return;
     }
 
@@ -999,17 +1032,26 @@
 
   /**
    * 按当前模式发起一次重试。
-   * - send：点发送按钮，走酒馆原生输入流程，发新请求。
-   * - regen：调用斜杠命令 /trigger，重新生成上一条回复。
+   * - send：点发送按钮，走酒馆原生输入流程，追加一条新回复（楼层 +1）。
+   * - regen：调用酒馆内部 Generate('regenerate')，重新生成上一条回复（楼层不变，内容被替换）。
    */
   function fireAttempt() {
     if (settings.mode === 'regen') {
       try {
-        var result = SillyTavern.getContext().executeSlashCommandsWithOptions('/trigger');
-        if (result && typeof result.catch === 'function') {
-          result.catch(function (err) {
-            console.warn('[自动重roll] 重新生成失败', err);
-          });
+        var ctx = SillyTavern.getContext();
+        // 优先用酒馆内部的 regenerate，它才会真正替换上一条回复；
+        // 斜杠命令 /trigger 在本环境下不生效，故不再使用。
+        if (typeof ctx.generate === 'function') {
+          var result = ctx.generate('regenerate');
+          if (result && typeof result.catch === 'function') {
+            result.catch(function (err) {
+              console.warn('[自动重roll] 重新生成失败', err);
+            });
+          }
+        } else {
+          state.lastErrorCode = 'NO_GENERATE_API';
+          state.lastErrorText = '酒馆没有提供重新生成接口';
+          render();
         }
       } catch (err) {
         console.warn('[自动重roll] 重新生成失败', err);
@@ -1062,11 +1104,14 @@
 
     on(types.GENERATION_STARTED, function () {
       state.status = 'waiting';
+      // 记录本轮生成开始的时间，用来显示"生成中 x 秒"
+      state.genStartedAt = Date.now();
       render();
     });
 
-    // 生成结束：正文为空即视为一次失败，带上序号记录
+    // 生成结束：清掉生成计时，正文为空即视为一次失败
     on(types.GENERATION_ENDED, function () {
+      state.genStartedAt = 0;
       var text = lastText();
       if (text.trim().length === 0) {
         state.failures += 1;
