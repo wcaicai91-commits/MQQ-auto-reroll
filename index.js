@@ -260,8 +260,12 @@
   // ------------------------------------------------------------ 样式
 
   var STYLE_TEXT = [
-    '#nana-auto-reroll-root{position:fixed;z-index:99999;font-family:inherit;font-size:13px;line-height:1.5;color:#e4e4e7;user-select:none;touch-action:none}',
-    '#nana-auto-reroll-root .nar-fab{position:relative;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:grab;background:rgba(28,28,31,.97);border:1px solid rgba(255,255,255,.10);box-shadow:0 3px 14px rgba(0,0,0,.45);transition:border-color .16s,background .16s}',
+    '#nana-auto-reroll-root{position:fixed;z-index:2147483000;font-family:inherit;font-size:13px;line-height:1.5;color:#e4e4e7;user-select:none;touch-action:none;-webkit-transform:translate3d(0,0,0);transform:translate3d(0,0,0);will-change:transform}',
+    // 手机上 fixed 常因父级 transform 失效，这里用媒体查询把根节点改成相对视口的绝对定位兜底
+    '@media (max-width:640px){#nana-auto-reroll-root{position:fixed!important;z-index:2147483000!important;transform:none!important}}',
+    // 手机上加粗按钮、加大点击区，避免手指点不准或看着太小
+    '@media (max-width:640px){#nana-auto-reroll-root .nar-fab{width:48px;height:48px;box-shadow:0 4px 18px rgba(0,0,0,.6);border-color:rgba(255,255,255,.22)}#nana-auto-reroll-root .nar-fab svg{width:22px;height:22px}}',
+    '#nana-auto-reroll-root .nar-fab{position:relative;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:grab;background:rgba(28,28,31,.97);border:1px solid rgba(255,255,255,.10);box-shadow:0 3px 14px rgba(0,0,0,.45);transition:border-color .16s,background .16s;-webkit-tap-highlight-color:transparent;touch-action:none}',
     '#nana-auto-reroll-root .nar-fab:hover{background:rgba(40,40,44,.98)}',
     '#nana-auto-reroll-root .nar-fab svg{width:20px;height:20px;color:rgba(200,200,206,.9)}',
     '#nana-auto-reroll-root .nar-fab.on{border-color:rgba(111,191,139,.55)}',
@@ -271,7 +275,7 @@
     '#nana-auto-reroll-root .nar-dot.busy{display:block;background:#d8a74a}',
     '#nana-auto-reroll-root .nar-dot.bad{display:block;background:#c25050}',
     '#nana-auto-reroll-root .nar-panel{position:absolute;bottom:56px;right:0;width:240px;padding:14px;border-radius:12px;background:rgba(28,28,31,.97);border:1px solid rgba(255,255,255,.10);box-shadow:0 8px 28px rgba(0,0,0,.5)}',
-    '@media (max-width:640px){#nana-auto-reroll-root .nar-panel{width:min(240px,calc(100vw - 24px));bottom:54px}}',
+    '@media (max-width:640px){#nana-auto-reroll-root .nar-panel{width:240px;max-width:90vw;left:auto;right:0;bottom:52px;max-height:420px;overflow-y:auto}}',
     '#nana-auto-reroll-root .nar-panel[hidden]{display:none}',
     '#nana-auto-reroll-root .nar-hide{display:none!important}',
     '#nana-auto-reroll-root .nar-switch{position:relative;display:inline-flex;align-items:center;padding:2px;border-radius:7px;background:rgba(0,0,0,.34);border:1px solid rgba(255,255,255,.10);cursor:pointer;font-family:inherit;font-size:12px}',
@@ -694,6 +698,8 @@
     dom.panel.hidden = !open;
     if (open) {
       var rect = dom.root.getBoundingClientRect();
+
+      // 水平方向：靠右放不下就改靠左
       if (rect.left + 240 > window.innerWidth) {
         dom.panel.style.right = 'auto';
         dom.panel.style.left = '0';
@@ -701,16 +707,43 @@
         dom.panel.style.right = '0';
         dom.panel.style.left = 'auto';
       }
+
+      // 垂直方向：按钮在上半屏时面板向下展开，否则向上展开，保证整块都在屏幕内
+      var spaceAbove = rect.top;
+      var spaceBelow = window.innerHeight - rect.bottom;
+      if (spaceAbove < 320 && spaceBelow > spaceAbove) {
+        // 上方放不下，改为从按钮下沿往下展开
+        dom.panel.style.top = '52px';
+        dom.panel.style.bottom = 'auto';
+      } else {
+        dom.panel.style.top = 'auto';
+        dom.panel.style.bottom = '52px';
+      }
     }
     render();
   }
 
   function applyPos() {
     if (!dom) return;
+
+    // 手机端一律忽略存档坐标，固定放在屏幕内右上区域。
+    // 存档坐标来自电脑，放到手机上经常落在屏幕外，这是手机看不到按钮的主因。
+    if (isNarrowScreen()) {
+      var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+      var vw = window.innerWidth || document.documentElement.clientWidth || 400;
+      var stickTop = Math.max(80, Math.round(vh * 0.35));
+      var stickRight = Math.max(8, vw * 0);
+      dom.root.style.left = 'auto';
+      dom.root.style.bottom = 'auto';
+      dom.root.style.right = (12 + stickRight) + 'px';
+      dom.root.style.top = stickTop + 'px';
+      dom.root.style.zIndex = '2147483000';
+      return;
+    }
+
     if (pos) {
       var maxX = window.innerWidth - 48;
       var maxY = window.innerHeight - 48;
-      // 手机等窄屏下，电脑上记下的坐标可能完全落在屏幕外，这里强制收回可见区域
       var x = Math.min(Math.max(0, pos.x), Math.max(0, maxX));
       var y = Math.min(Math.max(0, pos.y), Math.max(0, maxY));
       if (x !== pos.x || y !== pos.y) {
@@ -721,13 +754,6 @@
       dom.root.style.top = y + 'px';
       dom.root.style.right = 'auto';
       dom.root.style.bottom = 'auto';
-    } else if (isNarrowScreen()) {
-      // 窄屏（手机）：固定在右侧偏下，避免被输入栏和菜单遮挡
-      dom.root.style.left = 'auto';
-      dom.root.style.top = 'auto';
-      dom.root.style.right = '10px';   // 稍微贴近右边缘
-      dom.root.style.bottom = '80px';  // 改为固定像素，避免百分比缩放时飘走
-      dom.root.style.zIndex = '999999'; // 强行拉高层级
     } else {
       dom.root.style.left = 'auto';
       dom.root.style.top = 'auto';
