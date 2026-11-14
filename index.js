@@ -60,7 +60,9 @@
           backoffType: p.backoffType === 'linear' ? 'linear' : 'multiply',
           backoffStepSec: typeof p.backoffStepSec === 'number' ? p.backoffStepSec : 2,
           backoffMaxSec: typeof p.backoffMaxSec === 'number' ? p.backoffMaxSec : 300,
-          mode: p.mode === 'regen' ? 'regen' : 'send',
+          // 模式不持久化：每次加载一律回到"重新发送"，
+          // 避免上次误切到 regen 后被带进新一轮，导致发不出新楼层
+          mode: 'send',
         };
       }
     } catch (e) {
@@ -697,28 +699,12 @@
     if (!dom) return;
     dom.panel.hidden = !open;
     if (open) {
-      var rect = dom.root.getBoundingClientRect();
-
-      // 水平方向：靠右放不下就改靠左
-      if (rect.left + 240 > window.innerWidth) {
-        dom.panel.style.right = 'auto';
-        dom.panel.style.left = '0';
-      } else {
-        dom.panel.style.right = '0';
-        dom.panel.style.left = 'auto';
-      }
-
-      // 垂直方向：按钮在上半屏时面板向下展开，否则向上展开，保证整块都在屏幕内
-      var spaceAbove = rect.top;
-      var spaceBelow = window.innerHeight - rect.bottom;
-      if (spaceAbove < 320 && spaceBelow > spaceAbove) {
-        // 上方放不下，改为从按钮下沿往下展开
-        dom.panel.style.top = '52px';
-        dom.panel.style.bottom = 'auto';
-      } else {
-        dom.panel.style.top = 'auto';
-        dom.panel.style.bottom = '52px';
-      }
+      // 固定挂在触发器正上方，右边缘与触发器对齐。
+      // 不做左右翻转判断，避免面板每次都跳来跳去。
+      dom.panel.style.right = '0';
+      dom.panel.style.left = 'auto';
+      dom.panel.style.top = 'auto';
+      dom.panel.style.bottom = '52px';
     }
     render();
   }
@@ -901,19 +887,7 @@
     // 本轮已成功，任何残留的定时器都不再触发
     if (settled) return;
 
-    // 点击前先确认：如果上一次请求后已经产出了正文，就直接收手，
-    // 不能再发一次。这一步必须放在 fireAttempt 之前，否则会先发再判。
-    if (state.pendingSince > 0 && hasProduced()) {
-      settled = true;
-      state.baselineMessageId = lastId();
-      state.pendingSince = 0;
-      logSuccess();
-      stop('success');
-      return;
-    }
-
-    // 正在生成时不点，也不倒数。倒计时的意义是"还有多久发下一次"，
-    // 生成期间根本不该有下一次，显示剩余秒数会误导。
+    // 正在生成时不点，也不倒数，只轮询等待它结束
     if (isGenerating()) {
       state.status = 'waiting';
       clearCooldownDisplay();
@@ -922,7 +896,7 @@
       return;
     }
 
-    // 生成已结束。如果这一轮产出了正文，就是成功；否则视为失败，开始倒数
+    // 上一发已经发出，现在生成已结束，判断结果
     if (state.pendingSince > 0) {
       if (hasProduced()) {
         settled = true;
@@ -932,10 +906,9 @@
         stop('success');
         return;
       }
-      // 确认失败：才开始为下一轮倒数
+      // 失败：清掉标记，进入等待
       state.pendingSince = 0;
-      startNextCountdown();
-      return;
+      state.pendingTextBefore = null;
     }
 
     if (settings.maxAttempts >= 0 && state.attempts >= settings.maxAttempts) {
@@ -943,30 +916,33 @@
       return;
     }
 
-    fireAttempt();
+    // 如果已经在倒数，说明另一条链正在等待，直接返回即可（那边的定时器会继续推进）
+    if (state.waitUntil > 0) {
+      return;
+    }
 
-    state.attempts += 1;
-    state.pendingSince = lastId();
-    // 记下发起前的最后一条内容，供"重新生成"模式判断是否真的产出了新内容
-    state.pendingTextBefore = lastText();
-    state.status = 'retrying';
-    clearCooldownDisplay();
-    render();
-
-    timer = setTimeout(tryReroll, 300);
-    markPendingSuccess();
-  }
-
-  /** 确认失败后，为下一轮触发倒数；数完就点下一次 */
-  function startNextCountdown() {
     var wait = intervalMs();
     state.status = 'cooldown';
     startCooldown(wait);
     render();
     timer = setTimeout(function () {
       if (!settings.enabled || settled) return;
-      tryReroll();
+      clearCooldownDisplay();
+      doAttempt();
     }, wait);
+  }
+
+  /** 真正发出一次请求，只由 tryReroll 在倒计时结束后调用 */
+  function doAttempt() {
+    if (!settings.enabled || settled) return;
+    fireAttempt();
+    state.attempts += 1;
+    state.pendingSince = lastId();
+    state.pendingTextBefore = lastText();
+    state.status = 'retrying';
+    clearCooldownDisplay();
+    render();
+    timer = setTimeout(tryReroll, 300);
   }
 
   /**
@@ -1058,30 +1034,20 @@
 
   /**
    * 按当前模式发起一次重试。
-   * - send：点发送按钮，走酒馆原生输入流程，追加一条新回复（楼层 +1）。
-   * - regen：调用酒馆内部 Generate('regenerate')，重新生成上一条回复（楼层不变，内容被替换）。
+   * - send：点发送按钮，追加一条新回复（楼层 +1）。
+   * - regen：点最后一条消息上的"右滑/重新生成"按钮，重新生成当前这一条（楼层不变）。
    */
   function fireAttempt() {
     if (settings.mode === 'regen') {
-      try {
-        var ctx = SillyTavern.getContext();
-        // 优先用酒馆内部的 regenerate，它才会真正替换上一条回复；
-        // 斜杠命令 /trigger 在本环境下不生效，故不再使用。
-        if (typeof ctx.generate === 'function') {
-          var result = ctx.generate('regenerate');
-          if (result && typeof result.catch === 'function') {
-            result.catch(function (err) {
-              console.warn('[自动重roll] 重新生成失败', err);
-            });
-          }
-        } else {
-          state.lastErrorCode = 'NO_GENERATE_API';
-          state.lastErrorText = '酒馆没有提供重新生成接口';
-          render();
-        }
-      } catch (err) {
-        console.warn('[自动重roll] 重新生成失败', err);
+      // 酒馆的重新生成按钮：最后一条消息上的 .swipe_right
+      var regenBtn = document.querySelector('.last_mes .swipe_right');
+      if (!regenBtn) {
+        state.lastErrorCode = 'NO_REGENERATE_BUTTON';
+        state.lastErrorText = '找不到重新生成按钮，请确认最后一条是角色消息';
+        render();
+        return;
       }
+      regenBtn.click();
       return;
     }
 
@@ -1098,11 +1064,16 @@
   function scheduleReroll() {
     clearTimer();
     if (!settings.enabled) return;
-    state.status = 'waiting';
+    state.status = 'cooldown';
     render();
     var wait = intervalMs();
     startCooldown(wait);
-    timer = setTimeout(tryReroll, wait);
+    // 倒计时结束直接发一次，再交回 tryReroll 判断结果
+    timer = setTimeout(function () {
+      if (!settings.enabled || settled) return;
+      clearCooldownDisplay();
+      doAttempt();
+    }, wait);
   }
 
   // ------------------------------------------------------------ 事件绑定
